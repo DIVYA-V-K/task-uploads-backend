@@ -1,38 +1,30 @@
-
-from dotenv import load_dotenv
-load_dotenv()  # Loads variables from .env
-
-import mysql.connector
-from flask import Flask, request, jsonify, send_from_directory
+import os
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import boto3
 from botocore.exceptions import ClientError
-import os
+import mysql.connector
+from mysql.connector import Error
 
 # --- Initialize Flask ---
 app = Flask(__name__)
 CORS(app)
 
-# --- Serve React frontend ---
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def serve_react(path):
-    if path != "" and os.path.exists(f"frontend/build/{path}"):
-        return send_from_directory("frontend/build", path)
-    else:
-        return send_from_directory("frontend/build", "index.html")
-
-
-# --- Configuration ---
-
-
+# --- Configuration from Environment Variables ---
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = "ap-south-1"
-BUCKET_NAME = "zinivd-task-uploads"
+AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
+BUCKET_NAME = os.environ.get("S3_BUCKET", "zinivd-task-uploads")
 
+# MySQL Configuration (optional - only if you use remote MySQL)
+MYSQL_HOST = os.environ.get("MYSQL_HOST", "localhost")
+MYSQL_USER = os.environ.get("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "file-uploads")
+
+# Validate AWS credentials
 if not (AWS_ACCESS_KEY and AWS_SECRET_KEY):
-    raise RuntimeError("Missing AWS credentials! Set AWS_ACCESS_KEY and AWS_SECRET_KEY.")
+    raise RuntimeError("❌ Missing AWS credentials! Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in Render environment variables.")
 
 # --- Initialize S3 Client ---
 s3 = boto3.client(
@@ -42,7 +34,7 @@ s3 = boto3.client(
     region_name=AWS_REGION
 )
 
-# --- Allowed Extensions ---
+# --- Allowed File Extensions ---
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov', '.avi', '.webm'}
 
 def allowed_file(filename: str) -> bool:
@@ -50,7 +42,7 @@ def allowed_file(filename: str) -> bool:
     return any(filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
 
 def create_presigned_url(key: str, method: str, expires_in: int = 300, content_type: str = None):
-    """Helper function to generate a presigned URL for S3."""
+    """Generate a presigned URL for S3."""
     try:
         params = {"Bucket": BUCKET_NAME, "Key": key}
         if content_type:
@@ -61,16 +53,32 @@ def create_presigned_url(key: str, method: str, expires_in: int = 300, content_t
         return None
 
 def get_db_connection():
-    return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="file-uploads"
-    )
+    """Create MySQL connection (optional - comment out if not using MySQL)"""
+    try:
+        return mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
+        )
+    except Error as e:
+        app.logger.error(f"MySQL connection error: {e}")
+        return None
 
 # --- Routes ---
+
+@app.route("/", methods=["GET"])
+def home():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "✅ Backend is running!",
+        "bucket": BUCKET_NAME,
+        "region": AWS_REGION
+    }), 200
+
 @app.route("/generate-upload-url", methods=["POST"])
 def generate_upload_url():
+    """Generate presigned URL for uploading to S3"""
     try:
         data = request.get_json(force=True)
         filename = data.get("filename")
@@ -85,28 +93,15 @@ def generate_upload_url():
         if not url:
             return jsonify({"error": "Failed to generate upload URL"}), 500
 
-        # --- Store info in MySQL ---
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO uploads (filename, content_type) VALUES (%s, %s)",
-                (filename, content_type)
-            )
-            conn.commit()
-            cursor.close()
-            conn.close()
-        except Exception as e:
-            app.logger.error(f"MySQL insert error: {e}")
-
         return jsonify({"url": url, "filename": filename}), 200
 
     except Exception as e:
-        print("Error:", e)
+        app.logger.error(f"Upload URL error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/files", methods=["GET"])
 def list_files():
+    """List all files in S3 bucket"""
     try:
         response = s3.list_objects_v2(Bucket=BUCKET_NAME)
         contents = response.get("Contents", [])
@@ -124,11 +119,12 @@ def list_files():
 
         return jsonify({"files": file_list}), 200
     except ClientError as e:
-        return jsonify({"error": f"AWS Error: {e}"}), 500
-
+        app.logger.error(f"List files error: {e}")
+        return jsonify({"error": f"AWS Error: {str(e)}"}), 500
 
 @app.route("/save-file-info", methods=["POST"])
 def save_file_info():
+    """Save file metadata to MySQL (optional)"""
     data = request.get_json(force=True)
     filename = data.get("filename")
     content_type = data.get("contentType", "application/octet-stream")
@@ -136,8 +132,12 @@ def save_file_info():
     if not filename:
         return jsonify({"error": "Filename is required"}), 400
 
+    # Comment out MySQL logic if not using database
     try:
         conn = get_db_connection()
+        if not conn:
+            return jsonify({"message": "File uploaded (MySQL not configured)"}), 200
+        
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO uploads (filename, content_type) VALUES (%s, %s)",
@@ -149,11 +149,11 @@ def save_file_info():
         return jsonify({"message": f'File "{filename}" info saved successfully'}), 200
     except Exception as e:
         app.logger.error(f"MySQL insert error: {e}")
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({"message": "File uploaded (MySQL error)", "error": str(e)}), 200
 
 @app.route("/delete-file", methods=["DELETE"])
 def delete_file():
+    """Delete file from S3"""
     data = request.get_json(force=True)
     filename = data.get("filename")
 
@@ -164,10 +164,10 @@ def delete_file():
         s3.delete_object(Bucket=BUCKET_NAME, Key=filename)
         return jsonify({"message": f"🗑️ {filename} deleted successfully"}), 200
     except ClientError as e:
-        return jsonify({"error": f"AWS Error: {e}"}), 500
+        app.logger.error(f"Delete error: {e}")
+        return jsonify({"error": f"AWS Error: {str(e)}"}), 500
 
 # --- Run Server ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
-
-
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
